@@ -1,0 +1,6 @@
+{
+  "name": "@voice-agent/post-call-worker",
+  "private": true,
+  "type": "module"
+}
+

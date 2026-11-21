@@ -1,0 +1,85 @@
+name: voice-agent
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: voice_agent
+      POSTGRES_PASSWORD: voice_agent
+      POSTGRES_DB: voice_agent
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voice_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: voice_agent
+      RABBITMQ_DEFAULT_PASS: voice_agent
+    ports: ["5672:5672", "15672:15672"]
+    volumes: ["rabbitmq-data:/var/lib/rabbitmq"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:v1.8.4
+    command: --config /etc/livekit.yaml --node-ip 127.0.0.1
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./infra/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.113.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports: ["4317:4317", "4318:4318"]
+    volumes:
+      - ./infra/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    environment:
+      ORCHESTRATOR_PORT: 8081
+    ports: ["8081:8081"]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: apps/voice-gateway/Dockerfile
+    environment:
+      GATEWAY_PORT: 3000
+      ORCHESTRATOR_URL: http://orchestrator:8081
+    ports: ["3000:3000"]
+    depends_on: [orchestrator]
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:

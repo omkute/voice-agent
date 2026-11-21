@@ -1,0 +1,28 @@
+{
+  "name": "voice-agent-platform",
+  "private": true,
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "apps/*",
+    "services/post-call-worker",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run scripts/dev.ts",
+    "dev:gateway": "bun --watch apps/voice-gateway/src/index.ts",
+    "dev:orchestrator": "cd services/orchestrator && GOCACHE=/tmp/voice-agent-go-cache go run ./cmd/server",
+    "test": "bun test && cd services/orchestrator && GOCACHE=/tmp/voice-agent-go-cache go test ./...",
+    "check": "bun run typecheck && cd services/orchestrator && GOCACHE=/tmp/voice-agent-go-cache go test ./...",
+    "typecheck": "bunx tsc --noEmit",
+    "worker": "bun services/post-call-worker/src/index.ts"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.7",
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9"
+  }
+}
+

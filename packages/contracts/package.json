@@ -1,0 +1,9 @@
+{
+  "name": "@voice-agent/contracts",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/events.ts"
+  }
+}
+

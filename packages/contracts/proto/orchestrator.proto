@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package voiceagent.orchestrator.v1;
+
+option go_package = "github.com/example/voice-agent/gen/orchestrator/v1;orchestratorv1";
+
+service SessionOrchestrator {
+  rpc OpenSession(OpenSessionRequest) returns (SessionSnapshot);
+  rpc ApplyEvent(ApplyEventRequest) returns (ApplyEventResponse);
+  rpc CloseSession(CloseSessionRequest) returns (SessionSnapshot);
+}
+
+message OpenSessionRequest { string session_id = 1; }
+
+message ApplyEventRequest {
+  string session_id = 1;
+  string event_id = 2;
+  EventKind kind = 3;
+  string text = 4;
+  int64 occurred_at_unix_ms = 5;
+}
+
+message ApplyEventResponse {
+  SessionSnapshot session = 1;
+  repeated Action actions = 2;
+}
+
+message CloseSessionRequest { string session_id = 1; }
+
+message SessionSnapshot {
+  string session_id = 1;
+  SessionPhase phase = 2;
+  uint64 version = 3;
+  string active_turn_id = 4;
+}
+
+message Action {
+  ActionKind kind = 1;
+  string turn_id = 2;
+  string text = 3;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_SPEECH_STARTED = 1;
+  EVENT_KIND_TRANSCRIPT_FINAL = 2;
+  EVENT_KIND_RESPONSE_STARTED = 3;
+  EVENT_KIND_RESPONSE_FINISHED = 4;
+  EVENT_KIND_INTERRUPTED = 5;
+  EVENT_KIND_SESSION_ENDED = 6;
+}
+
+enum ActionKind {
+  ACTION_KIND_UNSPECIFIED = 0;
+  ACTION_KIND_CANCEL_RESPONSE = 1;
+  ACTION_KIND_REQUEST_RESPONSE = 2;
+  ACTION_KIND_PERSIST_TRANSCRIPT = 3;
+  ACTION_KIND_ENQUEUE_POST_CALL = 4;
+}
+
+enum SessionPhase {
+  SESSION_PHASE_UNSPECIFIED = 0;
+  SESSION_PHASE_LISTENING = 1;
+  SESSION_PHASE_THINKING = 2;
+  SESSION_PHASE_SPEAKING = 3;
+  SESSION_PHASE_INTERRUPTED = 4;
+  SESSION_PHASE_ENDED = 5;
+}

@@ -1,0 +1,6 @@
+{
+  "name": "@voice-agent/gateway",
+  "private": true,
+  "type": "module"
+}
+
