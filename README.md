@@ -1,380 +1,389 @@
-# Voice Agent Platform
+# Voice Agent
 
-A runnable, production-shaped scaffold for a low-latency voice agent. The demo streams microphone chunks over a WebSocket, moves each conversation through a Go session state machine, generates a deterministic mock response, speaks it in the browser, and reports turn latency. It requires no AI-provider credentials.
+Voice Agent is a distributed platform for building real-time, conversational AI experiences over live audio. It supports bidirectional voice streaming, speech recognition, LLM-driven dialogue, tool execution, speech synthesis, interruption handling, session monitoring, and post-call analytics.
 
-The repository is intentionally split between a **working local demo** and **production seams**. The demo uses in-memory state, an HTTP adapter to the Go orchestrator, and mock STT/LLM/TTS behavior. The protobuf contract, LiveKit, Redis, PostgreSQL, RabbitMQ, container definitions, and database schema show where production adapters connect without hiding unfinished integrations.
+The platform is designed for conversations that must feel immediate and natural. It coordinates the full voice loop—from detecting the end of a caller's turn to producing the first audible response—while preserving conversation context, handling failures, and exposing the telemetry needed to measure latency and reliability.
 
-## What works today
+## Core capabilities
 
-- Bidirectional browser session over WebSocket
-- Live microphone chunk streaming with partial activity feedback
-- Text input for deterministic testing
-- Conversation phases: listening, thinking, speaking, interrupted, ended
-- Barge-in/interruption cancellation
-- Idempotent, atomic Go session transitions
-- Mock transcription, LLM response, and browser speech synthesis
-- First-token and end-to-end latency measurements
-- Versioned gRPC/protobuf orchestration contract
-- RabbitMQ post-call worker scaffold
-- PostgreSQL call, transcript, and metric schema
-- Docker Compose definitions for LiveKit, Redis, RabbitMQ, and PostgreSQL
-- TypeScript and Go unit tests
+- **Bidirectional audio streaming** using WebRTC and WebSockets
+- **Streaming speech recognition** with partial and final transcripts
+- **LLM-driven conversations** with contextual, multi-turn dialogue
+- **Streaming speech synthesis** for low time-to-first-audio
+- **Turn detection** using voice activity and transcript events
+- **Barge-in handling** that cancels an active response when the caller interrupts
+- **Conversation context management** across turns and tool results
+- **Automated tool execution** with validation, timeouts, and idempotency
+- **Distributed session orchestration** across independently scalable services
+- **Real-time transcription and monitoring** for active calls
+- **Post-call processing** for summaries, analytics, scoring, and persistence
+- **Latency benchmarking** across STT, LLM, tool, and TTS stages
+- **End-to-end observability** through OpenTelemetry traces, metrics, and logs
 
 ## Architecture
 
 ```text
- Browser / caller
-  microphone + speaker
-          │
-          │ WebRTC in production
-          │ WebSocket in this demo
-          ▼
- ┌──────────────────────────┐
- │ TypeScript Voice Gateway │
- │ transport + voice loop   │
- └────────────┬─────────────┘
-              │ HTTP in demo / gRPC contract for production
-              ▼
- ┌──────────────────────────┐       ┌──────────────────────┐
- │ Go Session Orchestrator  │──────▶│ Redis session state  │
- │ turns + interrupts       │       └──────────────────────┘
- └──────┬───────────┬───────┘
-        │           │
-        │           └──────────────▶ STT → LLM/tools → TTS
-        │                              provider adapters
+ Client / Telephony Provider
+      microphone + speaker
+               │
+               │ WebRTC / WebSocket
+               ▼
+ ┌────────────────────────────┐
+ │     Voice Gateway          │
+ │ media, connections, auth   │
+ └─────────────┬──────────────┘
+               │ gRPC
+               ▼
+ ┌────────────────────────────┐        ┌───────────────────────┐
+ │   Session Orchestrator     │◀──────▶│ Redis                 │
+ │ state, turns, interruptions│        │ active session state  │
+ └──────┬──────────┬──────────┘        └───────────────────────┘
+        │          │
+        │          └──────────────┐
+        ▼                         ▼
+ ┌──────────────┐     ┌────────────────────────────┐
+ │ Streaming STT│     │ Conversation Runtime       │
+ └──────┬───────┘     │ LLM, context, tool runner  │
+        │             └─────────────┬──────────────┘
+        │                           │
+        └──────────────┬────────────┘
+                       ▼
+               ┌──────────────┐
+               │ Streaming TTS│
+               └──────┬───────┘
+                      │ synthesized audio
+                      ▼
+               Voice Gateway
+
+ Session completion
+        │
         ▼
- ┌──────────────────────────┐       ┌──────────────────────┐
- │ RabbitMQ post-call queue │──────▶│ Analytics worker     │
- └──────────────────────────┘       └──────────┬───────────┘
-                                               ▼
-                                      ┌────────────────────┐
-                                      │ PostgreSQL         │
-                                      │ calls/transcripts  │
-                                      └────────────────────┘
+ ┌─────────────────────┐      ┌───────────────────────┐
+ │ RabbitMQ            │─────▶│ Post-call Workers     │
+ │ asynchronous events │      │ summaries + analytics │
+ └─────────────────────┘      └───────────┬───────────┘
+                                          ▼
+                               ┌───────────────────────┐
+                               │ PostgreSQL            │
+                               │ calls, turns, metrics │
+                               └───────────────────────┘
 ```
 
-The orchestration module exposes one small interface: open a session, apply an event, or close it. Ordering, phase validation, idempotency, active-turn tracking, and resulting actions remain inside the module. This keeps transports and AI providers replaceable and makes the same interface the natural test surface.
+The media plane and control plane are intentionally separated. Audio remains on latency-sensitive streaming paths, while session commands, state transitions, transcripts, and tool results travel through typed control-plane interfaces.
 
-### Request path in the demo
+## Conversation lifecycle
 
-1. The browser opens `ws://localhost:3000/ws`.
-2. Holding the microphone button sends `MediaRecorder` chunks as binary WebSocket frames.
-3. Releasing the button commits the buffered utterance. The demo STT adapter reports a deterministic transcript based on received audio duration.
-4. The gateway sends `transcript_final` to the Go orchestrator.
-5. The orchestrator advances the session to `thinking` and returns actions that a production runtime would use to persist the transcript and request an LLM response.
-6. The mock LLM emits a response; the orchestrator moves through `speaking` and back to `listening`.
-7. Browser `SpeechSynthesis` acts as the demo TTS adapter, and the UI displays latency.
-8. Starting a new utterance during an active response aborts the old turn and records an interruption.
+### 1. Session establishment
 
-## Repository layout
+A client joins a LiveKit room or opens an authenticated WebSocket connection. The voice gateway creates a session, assigns media tracks, and registers the connection with the session orchestrator.
 
-```text
-apps/voice-gateway/              Bun/TypeScript WebSocket gateway and demo UI
-  public/index.html              Browser console and microphone client
-  src/pipeline.ts                Conversation pipeline and mock AI adapters
-  src/orchestrator.ts            Orchestration transport adapter
-services/orchestrator/           Go session orchestration module
-  cmd/server/                    Demo HTTP transport
-  internal/session/              State machine, actions, idempotency
-services/post-call-worker/       RabbitMQ analytics worker scaffold
-packages/contracts/
-  proto/orchestrator.proto       Versioned production gRPC contract
-  src/events.ts                  Browser/gateway event types
-infra/
-  livekit.yaml                   Local LiveKit configuration
-  postgres/migrations/           Durable call and analytics schema
-scripts/dev.ts                   Starts the two demo processes
-docker-compose.yml               Local platform dependencies and apps
-```
+### 2. Audio ingestion and transcription
 
-## Prerequisites
+Incoming audio is streamed to the speech recognition provider. Partial transcripts support live monitoring, while final transcripts create durable conversation turns and trigger response generation.
 
-For the credential-free demo:
+### 3. Turn orchestration
 
-- [Bun](https://bun.sh/) 1.3 or newer
-- Go 1.24 or newer
-- A current Chromium, Firefox, or Safari browser
+The orchestrator validates each event against the current session phase, maintains the active turn, and produces actions for the conversation runtime. Event identifiers make transitions idempotent across retries and reconnects.
 
-For the full local infrastructure, install Docker with Compose v2 as well. Microphone access works on `localhost`; deployed browsers require HTTPS.
+### 4. Response generation
 
-## Quick start
+The conversation runtime loads relevant context, streams tokens from the language model, and executes approved tools when required. Tool results are added to the conversation before response generation continues.
 
-```bash
-cp .env.example .env
-bun install
-bun run dev
-```
+### 5. Speech synthesis and playback
 
-Open [http://localhost:3000](http://localhost:3000), type a message, or hold the circular microphone button while speaking. The two local processes are:
+Generated text is streamed to the speech synthesis provider. Audio frames are returned to the caller as soon as they are available instead of waiting for the complete response.
 
-| Process | Address | Purpose |
-| --- | --- | --- |
-| Voice gateway | `http://localhost:3000` | UI, WebSocket transport, mock voice pipeline |
-| Orchestrator | `http://localhost:8081` | Session state and turn actions |
+### 6. Interruption handling
 
-`Ctrl+C` stops both processes. If port `3000` or `8081` is occupied, set `GATEWAY_PORT` or `ORCHESTRATOR_PORT` before starting.
+If caller speech is detected while the agent is thinking or speaking, the active turn is cancelled. Pending LLM output, tool work where safe, queued TTS audio, and outbound playback are stopped before a new caller turn begins.
 
-### Run with Docker Compose
+### 7. Post-call processing
 
-```bash
-docker compose up --build
-```
-
-This starts the demo applications plus:
-
-| Dependency | Address | Credentials |
-| --- | --- | --- |
-| PostgreSQL | `localhost:5432` | `voice_agent` / `voice_agent` |
-| Redis | `localhost:6379` | none (development only) |
-| RabbitMQ AMQP | `localhost:5672` | `voice_agent` / `voice_agent` |
-| RabbitMQ UI | [localhost:15672](http://localhost:15672) | `voice_agent` / `voice_agent` |
-| LiveKit | `ws://localhost:7880` | `devkey` / `secret` |
-| OpenTelemetry OTLP | `localhost:4317` / `localhost:4318` | none |
-
-The checked-in secrets are explicitly local development values. Never reuse them in a deployed environment.
-
-## Commands
-
-```bash
-bun run dev                 # run gateway and orchestrator with gateway reload
-bun run dev:gateway         # run only the TypeScript gateway
-bun run dev:orchestrator    # run only the Go orchestrator
-bun run test                # TypeScript and Go tests
-bun run check               # strict TypeScript check and Go tests
-bun run worker              # start RabbitMQ post-call worker
-make infra-up               # start only local dependencies
-make infra-down             # stop Compose resources
-```
-
-## Realtime protocol
-
-The WebSocket carries UTF-8 JSON control events and binary encoded audio chunks. Each JSON object has a `type` discriminator.
-
-Client events:
-
-| Type | Fields | Meaning |
-| --- | --- | --- |
-| `input.audio.start` | none | Begin an utterance; interrupts an active agent turn |
-| binary frame | encoded audio bytes | One microphone chunk |
-| `input.audio.commit` | none | Finish the utterance and request processing |
-| `input.text` | `text` | Bypass demo STT with deterministic text input |
-| `input.interrupt` | none | Explicitly cancel the active turn |
-| `session.end` | none | End the session and trigger post-call work |
-
-Server events:
-
-| Type | Important fields | Meaning |
-| --- | --- | --- |
-| `session.ready` | `sessionId`, `phase` | Transport is ready |
-| `session.phase` | `phase` | State machine changed phase |
-| `transcript.partial` | `text` | Non-final recognition/activity update |
-| `transcript.final` | `text` | Committed user utterance |
-| `agent.text` | `text` | Assistant response text |
-| `agent.audio` | `audio`, `mimeType` | Reserved for encoded production TTS frames |
-| `metrics.latency` | `firstTokenMs`, `totalMs` | Per-turn responsiveness |
-| `error` | `code`, `message` | Recoverable pipeline error |
-
-For a production stream, prefer binary frames with a compact header containing protocol version, frame kind, sequence number, timestamp, and codec. Keep control messages JSON or protobuf. Sequence numbers allow dropped/reordered frame metrics without interpreting audio.
+When the session ends, an asynchronous event starts transcript persistence, summarization, sentiment and quality analysis, latency aggregation, and any downstream business workflow.
 
 ## Session state model
 
 ```text
-              final transcript
-  LISTENING ───────────────────▶ THINKING
-      ▲                              │
-      │                              │ response started
-      │ response finished            ▼
-      └────────────────────────── SPEAKING
-                                      │
-                                      │ caller speech / interrupt
-                                      ▼
-                                  INTERRUPTED ──▶ LISTENING
+                       final transcript
+     ┌───────────┐ ─────────────────────────▶ ┌──────────┐
+     │ LISTENING │                            │ THINKING │
+     └─────▲─────┘ ◀───────────────┐          └────┬─────┘
+           │                       │               │ response starts
+           │ response completes    │               ▼
+           │                 ┌─────┴───────┐  ┌──────────┐
+           └─────────────────│ INTERRUPTED │◀─│ SPEAKING │
+                             └─────────────┘  └──────────┘
 
-  Any non-ended phase ── session ended ──▶ ENDED
+       Any active phase ─────── session ends ───────▶ ENDED
 ```
 
-Every state-changing event carries an `eventId`. The Go store remembers processed IDs and returns the current snapshot for duplicates without rerunning actions. In production, Redis should make the transition, version increment, and deduplication write atomic (typically one Lua script or a transaction with optimistic version checking).
+Every transition carries a stable event ID and session version. The state store applies deduplication, validation, and version updates atomically, ensuring that network retries cannot generate duplicate responses or execute the same tool twice.
 
-The state machine produces actions instead of directly calling infrastructure:
+The orchestration layer emits explicit actions such as:
 
 - `request_response`
 - `cancel_response`
 - `persist_transcript`
+- `execute_tool`
+- `publish_audio`
 - `enqueue_post_call`
 
-That separation keeps conversation policy independent of gRPC, Redis, AI vendors, and RabbitMQ.
+This keeps conversation policy independent from transports, storage engines, and AI providers.
 
-## Internal orchestration transports
+## Major services
 
-The demo uses HTTP to avoid requiring generated protobuf tools for first run:
+### Voice gateway
 
-```bash
-curl -X POST http://localhost:8081/v1/sessions/demo-1
+The TypeScript voice gateway owns client connectivity and the real-time media loop.
 
-curl -X POST http://localhost:8081/v1/sessions/demo-1/events \
-  -H 'content-type: application/json' \
-  -d '{"eventId":"evt-1","kind":"transcript_final","turnId":"turn-1","text":"Hello"}'
+- Terminates authenticated WebSocket or WebRTC sessions
+- Manages LiveKit rooms and media tracks
+- Streams inbound audio to speech recognition
+- Streams synthesized audio back to the caller
+- Applies backpressure and frame sequencing
+- Detects disconnects, reconnects, and media failures
+- Propagates session, turn, and trace identifiers
 
-curl http://localhost:8081/v1/sessions/demo-1
-```
+### Session orchestrator
 
-The production interface is defined in `packages/contracts/proto/orchestrator.proto`. Generate Go and TypeScript clients in CI with pinned `buf`/`protoc` plugins, commit or publish the generated package, then replace `HttpOrchestrator` with the gRPC adapter. The state module itself does not change.
+The Go orchestrator is the authority for conversation state.
 
-Recommended gRPC behavior:
+- Maintains session and turn phases
+- Enforces valid event ordering
+- Handles interruption and cancellation
+- Deduplicates retried events
+- Coordinates context and response actions
+- Persists ephemeral state in Redis
+- Exposes typed gRPC interfaces to other services
 
-- Deadlines: 100–250 ms for session events
-- Retry only unavailable/idempotent requests, keyed by `event_id`
-- Propagate W3C trace context through metadata
-- Enforce message-size limits; audio should stay on the media plane
-- Use mTLS or workload identity between deployed services
+### Conversation runtime
 
-## Production adapter plan
+The conversation runtime coordinates model requests and tools.
 
-| Concern | Demo adapter | Production adapter |
-| --- | --- | --- |
-| Media ingress/egress | Browser WebSocket + `MediaRecorder` | LiveKit room tracks over WebRTC |
-| Speech recognition | Audio-duration mock | Streaming STT provider with partial/final results |
-| LLM | Deterministic local function | Streaming model client with tool calling |
-| Speech synthesis | Browser `SpeechSynthesis` | Streaming TTS audio into LiveKit track |
-| Session state | In-memory Go map | Redis atomic state repository with TTL |
-| Orchestration RPC | HTTP/JSON adapter | Generated gRPC client/server |
-| Durable history | Schema only | PostgreSQL repository/batched writer |
-| Post-call jobs | Worker scaffold | RabbitMQ publisher, retries, DLQ, idempotent consumers |
+- Builds prompts from system policy and conversation context
+- Streams model output incrementally
+- Validates structured tool calls
+- Enforces per-tool permissions and deadlines
+- Adds bounded tool results back into model context
+- Rejects output from turns that are no longer active
 
-Provider adapters should accept an `AbortSignal`/context. When barge-in occurs, cancel the LLM stream first, flush queued TTS frames, and stop the outbound media track before acknowledging the transition. This prevents stale speech after the caller has resumed.
+### Post-call workers
 
-## Tool execution
+RabbitMQ workers process work that does not belong on the real-time path.
 
-Model-requested tools should not execute directly inside the LLM stream callback. A production tool runner should:
+- Generate call summaries
+- Calculate latency and quality metrics
+- Perform sentiment or outcome analysis
+- Persist final transcripts and metadata
+- Trigger integrations, webhooks, or CRM updates
+- Retry failures through bounded retry queues and dead-letter queues
 
-1. Validate the tool name and JSON arguments against an allowlisted schema.
-2. Assign a stable execution ID for deduplication.
-3. Apply per-tool deadlines and concurrency limits.
-4. Redact secrets and sensitive arguments from logs and traces.
-5. Record request/result metadata in the conversation context.
-6. Return a bounded result to the model or a safe user-facing failure.
+## Technology stack
 
-Long-running or side-effecting tools need confirmation policy and compensating behavior. Never retry a non-idempotent tool merely because an RPC deadline expired.
+| Technology | Role |
+| --- | --- |
+| **Go** | Session orchestration and latency-sensitive backend services |
+| **Node.js / TypeScript** | Voice gateway, conversation runtime, integrations, and workers |
+| **WebRTC** | Low-latency bidirectional media transport |
+| **WebSockets** | Realtime client events, transcripts, and control messages |
+| **gRPC / Protocol Buffers** | Typed internal service communication |
+| **LiveKit** | WebRTC rooms, participants, and audio tracks |
+| **Redis** | Ephemeral session state, event deduplication, and ownership leases |
+| **PostgreSQL** | Calls, transcripts, tool results, and analytics |
+| **RabbitMQ** | Asynchronous post-call workflows and event delivery |
+| **Docker** | Reproducible services and local infrastructure |
+| **OpenTelemetry** | Distributed traces, metrics, logs, and latency analysis |
 
-## Data and retention
+## Realtime event model
 
-PostgreSQL migrations create:
+The client protocol combines binary audio frames with typed control events.
 
-- `calls`: durable lifecycle and metadata
-- `conversation_turns`: ordered user, agent, and tool transcripts
-- `call_metrics`: aggregate latency and reliability measures
+### Client events
 
-Raw audio should normally live in object storage rather than PostgreSQL. Store only an object reference, encryption metadata, duration, and retention deadline. Define deletion workflows for audio, transcripts, model context, and trace attributes; voice data can contain sensitive and biometric information.
+| Event | Purpose |
+| --- | --- |
+| `session.start` | Establish a new voice session |
+| `input.audio.start` | Signal the beginning of caller speech |
+| `input.audio.commit` | Commit the current utterance |
+| `input.text` | Submit text through the same conversation pipeline |
+| `input.interrupt` | Cancel the active agent turn |
+| `session.end` | Close the session and start post-call processing |
 
-Redis keys should have bounded lifetimes, for example:
+### Server events
+
+| Event | Purpose |
+| --- | --- |
+| `session.ready` | Confirm that the realtime session is available |
+| `session.phase` | Report the current conversation phase |
+| `transcript.partial` | Deliver an interim speech recognition result |
+| `transcript.final` | Deliver the committed caller utterance |
+| `agent.text` | Stream assistant response text |
+| `agent.audio` | Stream synthesized audio frames |
+| `tool.status` | Report tool execution progress or failure |
+| `metrics.latency` | Report per-turn latency measurements |
+| `error` | Report a recoverable or terminal session error |
+
+Binary media frames include a protocol version, frame type, sequence number, capture timestamp, and codec metadata. This allows the gateway to detect dropped or reordered audio without decoding the payload.
+
+## Service communication
+
+Internal services communicate over gRPC using versioned Protocol Buffer contracts. Audio does not pass through orchestration RPCs; gRPC carries session events, transcripts, state snapshots, actions, and tool results.
+
+RPC behavior follows several rules:
+
+- Every state-changing request includes an idempotency key.
+- Deadlines are mandatory and included in the latency budget.
+- Retries are limited to safe, idempotent operations.
+- W3C trace context is propagated through metadata.
+- Message sizes are bounded to protect the control plane.
+- Service-to-service identity is enforced with mTLS or workload identity.
+
+## Context and tool execution
+
+Conversation context combines recent turns, system policy, tool results, and retrieved knowledge. Context is bounded by a configurable token budget so long calls do not continuously increase response time and cost.
+
+Tools execute through a controlled runner rather than directly inside model callbacks:
+
+1. Validate the tool name against an allowlist.
+2. Validate arguments against the tool's schema.
+3. Assign an execution ID for deduplication.
+4. Apply authorization, deadlines, and concurrency limits.
+5. Execute the tool and sanitize its result.
+6. Record metadata without leaking secrets.
+7. Return a bounded result to the active model turn.
+
+Side-effecting tools require explicit idempotency behavior and, where appropriate, user confirmation. A timed-out non-idempotent request is never retried blindly.
+
+## Data model
+
+PostgreSQL stores durable conversation data:
+
+- **Calls** — lifecycle, participant, channel, status, and metadata
+- **Conversation turns** — ordered user, agent, and tool messages
+- **Tool executions** — arguments, status, duration, and bounded results
+- **Call metrics** — latency percentiles, interruption count, and media quality
+- **Post-call results** — summaries, outcomes, scores, and integration status
+
+Redis stores short-lived operational state:
 
 ```text
-session:{session_id}:state       JSON/hash, TTL refreshed while active
-session:{session_id}:events      deduplication IDs, same TTL
-session:{session_id}:lease       gateway ownership with short TTL
+session:{session_id}:state       active phase, version, and turn
+session:{session_id}:events      processed event IDs
+session:{session_id}:lease       gateway ownership and expiry
+session:{session_id}:context     bounded working context
 ```
 
-## Queue topology
+Raw audio belongs in encrypted object storage with an explicit retention deadline. PostgreSQL stores only its reference, duration, encryption metadata, and deletion status.
 
-A useful RabbitMQ production topology is:
+## Messaging topology
+
+RabbitMQ separates asynchronous workloads from the real-time voice loop.
 
 ```text
-exchange: voice-agent.events (topic, durable)
-  routing key: call.completed.v1
-  queue: voice-agent.post-call.v1
-  dead-letter queue: voice-agent.post-call.dlq.v1
+exchange: voice-agent.events
+  ├── call.started.v1
+  ├── call.completed.v1 ─────▶ voice-agent.post-call.v1
+  ├── transcript.ready.v1 ───▶ voice-agent.analytics.v1
+  └── tool.completed.v1 ─────▶ voice-agent.integrations.v1
+
+failed messages ─────────────▶ voice-agent.dead-letter.v1
 ```
 
-Consumers must be idempotent on `jobId` or `(sessionId, jobType, version)`. Acknowledge only after durable writes finish. Use delayed retries with bounded attempts rather than immediate requeue loops.
+Consumers acknowledge messages only after durable work completes. Jobs are idempotent on a stable job ID, retries are bounded, and poison messages are moved to a dead-letter queue for investigation.
 
-## Observability and latency
+## Observability
 
-Instrument the gateway and orchestrator with OpenTelemetry traces, metrics, and structured logs. Carry `session_id`, `turn_id`, and `trace_id` as correlation fields, but keep raw transcript/audio content out of telemetry by default.
-
-Recommended spans:
+OpenTelemetry connects the full path of every voice turn:
 
 ```text
-voice.turn
-├── stt.finalize
-├── orchestrator.apply_event
-├── context.load
-├── llm.first_token
-├── tool.execute (zero or more)
-└── tts.first_audio
+voice.session
+└── voice.turn
+    ├── audio.receive
+    ├── stt.finalize
+    ├── orchestrator.apply_event
+    ├── context.load
+    ├── llm.first_token
+    ├── tool.execute
+    ├── tts.first_audio
+    └── audio.publish
 ```
 
-Recommended service-level indicators:
+Traces, metrics, and structured logs share `session_id`, `turn_id`, and `trace_id` correlation fields. Transcript text, audio, credentials, and sensitive tool arguments are excluded from telemetry by default.
 
-- Time from speech end to final transcript
+Key service-level indicators include:
+
+- Speech end to final transcript
 - Final transcript to first model token
-- First model token to first synthesized audio frame
-- End of caller speech to first audible response (p50/p95/p99)
-- Interruption-to-playback-stop latency
-- Audio frame loss/reorder rate
-- Session setup success and unexpected disconnect rate
-- Tool success, timeout, and duplicate execution rates
+- First model token to first synthesized audio
+- Speech end to first audible response
+- Interruption to playback stop
+- Audio frame loss and reorder rate
+- Session establishment and reconnect success rate
+- Tool success, timeout, and duplicate execution rate
+- End-to-end latency at p50, p95, and p99
 
-The demo's latency card measures final transcript → mock first token and final transcript → completed response. It is a pipeline sanity check, not a media quality benchmark.
+## Reliability
 
-### Benchmark method
+- Session ownership leases prevent concurrent writers.
+- Atomic state transitions protect event ordering and deduplication.
+- Late results are discarded when their turn is no longer active.
+- Every streaming stage has a bounded buffer and backpressure policy.
+- Provider calls carry deadlines and cancellation signals.
+- Connection recovery resumes from the latest session version.
+- PostgreSQL outbox records coordinate durable writes and event publication.
+- Health and readiness probes distinguish process health from dependency health.
+- Load shedding protects active calls when latency exceeds safe limits.
 
-For repeatable benchmarks, replay timestamped PCM fixtures instead of a live microphone, inject fixed provider latency distributions, and record results by commit. Include warm and cold runs, concurrent session counts, packet loss/jitter, response length, and tool usage. Report percentiles, sample count, errors, and hardware rather than only an average.
+## Security and privacy
 
-## Reliability considerations
+Voice conversations can contain personal, confidential, and biometric information. The platform treats audio and transcripts as sensitive data.
 
-- Use a session ownership lease so only one gateway writes a session at a time.
-- Resume from the latest Redis version after gateway reconnects.
-- Bound every queue between media, STT, LLM, and TTS; choose an explicit drop/backpressure policy.
-- Discard late results whose `turn_id` is no longer active.
-- Make event handling idempotent across gRPC retry and process restart.
-- Use an outbox when publishing RabbitMQ events from a PostgreSQL state change.
-- Add health checks for process liveness and readiness checks for required dependencies.
-- Shed load before tail latency makes all active calls unusable.
+- TLS protects WebRTC, WebSocket, HTTP, and gRPC traffic.
+- Room and session tokens are short-lived and scoped to one call.
+- Internal workloads use mTLS or workload identity.
+- Provider credentials are loaded from a secret manager.
+- Audio, transcripts, and tool data are encrypted at rest.
+- Recording requires explicit consent and visible retention policy.
+- Logs and traces redact prompts, transcripts, credentials, and tool arguments.
+- Rate, payload, duration, and concurrency limits protect public interfaces.
+- Retention and deletion workflows cover audio, transcripts, context, and telemetry.
 
-## Security checklist
+## Performance engineering
 
-- Terminate TLS for WebSocket/WebRTC and use mTLS or workload identity internally.
-- Authenticate room/session tokens and scope them to one call with a short expiry.
-- Put all provider credentials in a secret manager, never client code or images.
-- Validate event sizes, rate-limit sessions, and enforce audio duration limits.
-- Treat transcript, audio, and tool data as sensitive; encrypt in transit and at rest.
-- Redact authorization headers, prompts, transcripts, and tool arguments from logs.
-- Require explicit consent for recording and document retention/deletion behavior.
-- Run containers as non-root with read-only filesystems where possible.
+Voice responsiveness is measured as a pipeline rather than a single request duration. Each stage receives an explicit latency budget, and streaming is used wherever it shortens the critical path.
 
-## Testing strategy
+Benchmarks replay timestamped audio fixtures at controlled concurrency and capture:
 
-Current tests cover complete turns, interruption cancellation, state transitions, generated actions, and duplicate event handling.
+- Warm and cold provider behavior
+- Network jitter, loss, and reordering
+- Short and long utterances
+- Responses with and without tools
+- Concurrent session saturation
+- Cancellation and interruption latency
+- Provider timeout and recovery behavior
 
-```bash
-bun run test
-```
-
-The next valuable layers are:
-
-1. Contract tests that replay the same event fixtures through HTTP and gRPC adapters.
-2. Integration tests using disposable Redis, RabbitMQ, and PostgreSQL containers.
-3. Browser tests for microphone permission, reconnect, and playback cancellation.
-4. Load tests with synthetic audio and hundreds of concurrent sessions.
-5. Failure injection for provider timeouts, reordered events, process restarts, and queue redelivery.
-
-## Roadmap
-
-- Generate and wire the gRPC clients/server from the included protobuf contract
-- Add Redis session and lease adapters
-- Add LiveKit room/token service and media-track worker
-- Implement streaming STT, LLM tool calling, and streaming TTS adapters
-- Persist calls through an outbox and publish post-call jobs
-- Export OpenTelemetry data to a collector and add dashboards
-- Add authentication, quotas, consent, retention, and deployment manifests
+Results are reported with sample count, error rate, hardware profile, and p50/p95/p99 distributions. This makes regressions visible and keeps performance goals tied to the caller's experience.
 
 ## Design principles
 
-- Keep the media plane separate from the control plane.
-- Make turn identity and cancellation explicit everywhere.
-- Keep the orchestration interface small while hiding ordering and consistency rules inside it.
-- Make external providers adapters, not conversation policy.
-- Prefer deterministic local fakes for development and contract tests.
-- Treat latency budgets and failure behavior as product requirements, not afterthoughts.
+- Keep media transport separate from session control.
+- Make turn identity, ordering, and cancellation explicit.
+- Stream audio, transcripts, model output, and synthesis results.
+- Keep provider integrations behind replaceable interfaces.
+- Use ephemeral storage for active state and durable storage for history.
+- Move non-critical work off the real-time path.
+- Design every state-changing operation for retries and deduplication.
+- Treat latency, observability, privacy, and failure handling as product features.
 
-This scaffold is suitable for a portfolio demo, architectural spike, or the starting point for a production implementation. The mock labels are deliberate: replacing them should be a sequence of adapter changes, not a rewrite of session behavior.
+## Use cases
+
+- AI customer support and contact-center assistants
+- Appointment scheduling and qualification agents
+- Interactive voice response modernization
+- Sales and lead qualification calls
+- Voice-enabled product copilots
+- Real-time interview and coaching systems
+- Internal helpdesk and operations assistants
+- Multilingual conversational applications
+
+Voice Agent provides the infrastructure and orchestration model required to turn streaming speech, language models, tools, and synthesized audio into reliable real-time conversations.
